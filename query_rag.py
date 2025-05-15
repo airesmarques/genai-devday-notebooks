@@ -9,6 +9,9 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 import requests
 from datetime import datetime
 import openai
+import re
+from visense_api import ViSenseAPI
+import uuid
 
 # Name for vector search index
 INDEX_NAME = "vector_index"
@@ -128,9 +131,43 @@ def retrieve_session_history(collection, session_id):
         return messages
     return []
 
-# Now modify the generate_answer function to use memory
+# Add this function to recognize machine references
+def extract_machine_info(query):
+    """Extract laundry ID and machine number from user query."""
+    # Default to L1 if no specific laundry mentioned
+    laundry_id = "L1"
+    
+    # Check if L2/Avenida is explicitly mentioned
+    if any(location in query.lower() for location in ["l2", "avenida", "antónio vasconcelos", "antonio vasconcelos"]):
+        laundry_id = "L2"
+    elif any(location in query.lower() for location in ["l1", "brasil", "rua do brasil"]):
+        laundry_id = "L1"
+        
+    # Try to extract machine number - look for digits after words like "machine", "máquina", etc.
+    machine_match = re.search(r'(?:máquina|maquina|machine|número|numero|number)\s*(?:de\s*(?:lavar|secar)\s*)?(?:número|numero|number)?\s*(\d+)', 
+                           query.lower())
+    
+    machine_number = None
+    if machine_match:
+        machine_number = machine_match.group(1)
+    
+    return laundry_id, machine_number
+
+# Add a function to detect door issues
+def is_door_issue(query):
+    """Check if query is about door not opening."""
+    door_keywords = [
+        "porta não abre", "porta nao abre", "não consigo abrir", "nao consigo abrir",
+        "porta presa", "porta bloqueada", "porta fechada", "door", "porta", 
+        "não abre", "nao abre", "stuck", "bloqueada", "travada"
+    ]
+    
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in door_keywords)
+
+# Modify generate_answer to handle machine actions
 def generate_answer(db, collection, user_query, openai_api_key, session_id="default", model="gpt-4o"):
-    """Generate answer with conversation memory using OpenAI."""
+    """Generate answer with conversation memory and API actions."""
     # Make sure we have a history collection
     history_collection = db["chat_history"]
     
@@ -138,21 +175,60 @@ def generate_answer(db, collection, user_query, openai_api_key, session_id="defa
     if "session_id" not in history_collection.index_information():
         history_collection.create_index("session_id")
     
+    # Check for action opportunities
+    perform_action = False
+    action_response = None
+    
+    # Check if this is a door issue and potentially needs machine reboot
+    if is_door_issue(user_query):
+        laundry_id, machine_number = extract_machine_info(user_query)
+        
+        if machine_number:
+            # We have a door issue and a machine number - ask if user wants to reboot
+            message_history = retrieve_session_history(history_collection, session_id)
+            
+            # Check if we already suggested rebooting in this conversation
+            reboot_suggested = any("reiniciar" in msg.get("content", "").lower() or 
+                                 "reboot" in msg.get("content", "").lower() 
+                                 for msg in message_history if msg.get("role") == "assistant")
+            
+            if reboot_suggested:
+                # Check if user confirmed wanting to reboot
+                confirm_keywords = ["sim", "yes", "confirmo", "reiniciar", "reboot", "reset", "ok"]
+                if any(keyword in user_query.lower() for keyword in confirm_keywords):
+                    # User confirmed - execute reboot
+                    try:
+                        api = ViSenseAPI()
+                        result = api.reboot_machine(laundry_id, machine_number)
+                        
+                        if result.get("status") == "success":
+                            action_response = f"✅ Máquina {machine_number} da lavandaria {laundry_id} reiniciada com sucesso! Por favor, tente abrir a porta novamente. Caso não consiga, aguarde 1 minuto e tente novamente."
+                        else:
+                            action_response = f"❌ Não foi possível reiniciar a máquina {machine_number}. Erro: {result.get('message', 'desconhecido')}. Por favor, tente seguir as instruções manuais ou contacte-nos."
+                        
+                        perform_action = True
+                    except Exception as e:
+                        action_response = f"❌ Ocorreu um erro ao tentar reiniciar a máquina: {str(e)}. Por favor, tente seguir as instruções manuais ou contacte-nos."
+                        perform_action = True
+    
     # Initialize OpenAI client
     client = openai.OpenAI(api_key=openai_api_key)
     
-    # Get relevant documents
+    # If we performed an action, use that as the answer
+    if perform_action and action_response:
+        # Store the conversation
+        store_chat_message(history_collection, session_id, "user", user_query)
+        store_chat_message(history_collection, session_id, "assistant", action_response)
+        return action_response
+    
+    # Otherwise, continue with regular RAG flow
     docs = vector_search(collection, user_query)
-    
-    # Create context prompt
     context_prompt = create_prompt(docs, user_query)
-    
-    # Add message history from previous interactions
     message_history = retrieve_session_history(history_collection, session_id)
     
     # Format messages for OpenAI
     messages = [
-        {"role": "system", "content": context_prompt}  # OpenAI supports system role
+        {"role": "system", "content": context_prompt}
     ]
     
     # Add conversation history
@@ -172,6 +248,11 @@ def generate_answer(db, collection, user_query, openai_api_key, session_id="defa
     
     # Extract answer
     answer = response.choices[0].message.content
+    
+    # If this is a door issue but we don't have machine number, suggest getting it
+    if is_door_issue(user_query) and not perform_action:
+        if not machine_number:
+            answer += "\n\nPara que eu possa ajudar a reiniciar a máquina, preciso saber o número da máquina. Pode me dizer qual é o número da máquina?"
     
     # Store the conversation
     store_chat_message(history_collection, session_id, "user", user_query)
@@ -196,8 +277,8 @@ def main():
     )
     parser.add_argument(
         "--session", "-s",
-        help="Session ID for conversation memory (default: default)",
-        default="default"
+        help="Session ID for conversation memory (default: generate new)",
+        default=None
     )
     parser.add_argument(
         "--model", "-m",
@@ -205,6 +286,13 @@ def main():
         default="gpt-4o"
     )
     args = parser.parse_args()
+
+    # Generate a unique session ID if not provided
+    if args.session is None:
+        session_id = str(uuid.uuid4())
+        print(f"New session created with ID: {session_id}")
+    else:
+        session_id = args.session
 
     client = MongoClient(mongodb_uri, appname="pagalava-chatbot")
     db = client["mongodb_genai_devday_rag"]
@@ -224,19 +312,19 @@ def main():
 
     # Interactive mode if no question is provided
     if not args.question:
-        print(f"Assistente PagaLava - Sessão: {args.session} (usando {args.model})")
+        print(f"Assistente PagaLava - Sessão: {session_id} (usando {args.model})")
         print("Digite 'sair' para encerrar o chat.")
         while True:
             question = input("\nComo posso ajudar com suas necessidades de lavanderia? ")
             if question.lower() in ["sair", "exit"]:
                 break
             print("\nAssistente PagaLava:")
-            answer = generate_answer(db, collection, question, openai_api_key, args.session, args.model)
+            answer = generate_answer(db, collection, question, openai_api_key, session_id, args.model)
             print(answer)
     else:
         # One-off query mode
         print("\nAssistente PagaLava:")
-        answer = generate_answer(db, collection, args.question, openai_api_key, args.session, args.model)
+        answer = generate_answer(db, collection, args.question, openai_api_key, session_id, args.model)
         print(answer)
 
 if __name__ == "__main__":
