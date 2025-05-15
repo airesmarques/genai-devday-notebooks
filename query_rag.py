@@ -8,6 +8,7 @@ from pymongo import MongoClient
 from sentence_transformers import SentenceTransformer, CrossEncoder
 import requests
 from datetime import datetime
+import openai
 
 # Name for vector search index
 INDEX_NAME = "vector_index"
@@ -128,8 +129,8 @@ def retrieve_session_history(collection, session_id):
     return []
 
 # Now modify the generate_answer function to use memory
-def generate_answer(db, collection, user_query, serverless_url, session_id="default"):
-    """Generate answer with conversation memory."""
+def generate_answer(db, collection, user_query, openai_api_key, session_id="default", model="gpt-4o"):
+    """Generate answer with conversation memory using OpenAI."""
     # Make sure we have a history collection
     history_collection = db["chat_history"]
     
@@ -137,12 +138,8 @@ def generate_answer(db, collection, user_query, serverless_url, session_id="defa
     if "session_id" not in history_collection.index_information():
         history_collection.create_index("session_id")
     
-    # Get chat history
-    messages = []
-    
-    # First, check if this is on-topic
-    if not is_on_topic(user_query):
-        print("Off-topic query detected, but will let instructions guide the model")
+    # Initialize OpenAI client
+    client = openai.OpenAI(api_key=openai_api_key)
     
     # Get relevant documents
     docs = vector_search(collection, user_query)
@@ -150,31 +147,31 @@ def generate_answer(db, collection, user_query, serverless_url, session_id="defa
     # Create context prompt
     context_prompt = create_prompt(docs, user_query)
     
-    # Instead of system message, use user message for the context/instructions
-    # This is compatible with more LLM APIs
-    user_context_message = {"role": "user", "content": context_prompt}
-    messages.append(user_context_message)
-    
-    # Add a mock assistant response to maintain the conversation flow
-    messages.append({"role": "assistant", "content": "I'll help you with that question."})
-    
     # Add message history from previous interactions
     message_history = retrieve_session_history(history_collection, session_id)
+    
+    # Format messages for OpenAI
+    messages = [
+        {"role": "system", "content": context_prompt}  # OpenAI supports system role
+    ]
+    
+    # Add conversation history
     messages.extend(message_history)
     
     # Add current user question
-    user_message = {"role": "user", "content": user_query}
-    messages.append(user_message)
+    messages.append({"role": "user", "content": user_query})
     
-    # Get response from LLM
-    print("Requesting answer from LLM...")
-    response = requests.post(
-        serverless_url,
-        json={"task": "completion", "data": messages},
+    # Get response from OpenAI
+    print("Requesting answer from GPT-4...")
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=1000
     )
-    response.raise_for_status()
-    data = response.json()
-    answer = data.get("text", "")
+    
+    # Extract answer
+    answer = response.choices[0].message.content
     
     # Store the conversation
     store_chat_message(history_collection, session_id, "user", user_query)
@@ -185,9 +182,10 @@ def generate_answer(db, collection, user_query, serverless_url, session_id="defa
 def main():
     load_dotenv()
     mongodb_uri = os.getenv("MONGODB_URI")
-    serverless_url = os.getenv("SERVERLESS_URL")
-    if not mongodb_uri or not serverless_url:
-        print("Error: MONGODB_URI and SERVERLESS_URL must be set in .env")
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    
+    if not mongodb_uri or not openai_api_key:
+        print("Error: MONGODB_URI and OPENAI_API_KEY must be set in .env")
         exit(1)
 
     parser = argparse.ArgumentParser(description="PagaLava Chatbot")
@@ -200,6 +198,11 @@ def main():
         "--session", "-s",
         help="Session ID for conversation memory (default: default)",
         default="default"
+    )
+    parser.add_argument(
+        "--model", "-m",
+        help="OpenAI model to use (default: gpt-4o)",
+        default="gpt-4o"
     )
     args = parser.parse_args()
 
@@ -221,19 +224,19 @@ def main():
 
     # Interactive mode if no question is provided
     if not args.question:
-        print(f"Assistente PagaLava - Sessão: {args.session}")
+        print(f"Assistente PagaLava - Sessão: {args.session} (usando {args.model})")
         print("Digite 'sair' para encerrar o chat.")
         while True:
             question = input("\nComo posso ajudar com suas necessidades de lavanderia? ")
             if question.lower() in ["sair", "exit"]:
                 break
             print("\nAssistente PagaLava:")
-            answer = generate_answer(db, collection, question, serverless_url, args.session)
+            answer = generate_answer(db, collection, question, openai_api_key, args.session, args.model)
             print(answer)
     else:
         # One-off query mode
         print("\nAssistente PagaLava:")
-        answer = generate_answer(db, collection, args.question, serverless_url, args.session)
+        answer = generate_answer(db, collection, args.question, openai_api_key, args.session, args.model)
         print(answer)
 
 if __name__ == "__main__":
