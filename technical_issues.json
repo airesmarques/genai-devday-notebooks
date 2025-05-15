@@ -1,0 +1,54 @@
+[
+    {
+        "question": "Paguei 24 minutos e só aparecem 12",
+        "answer": "Aguarde um momento por favor. Vamos entrar em contacto e ativar. Por favor confirme quando o tempo for creditado.",
+        "conditions": [],
+        "apiActions": [
+            "Check payment status",
+            "Credit additional time if necessary"
+        ]
+    },
+    {
+        "question": "Paguei a maquina de secar numero 7 e não liberou",
+        "answer": "Já passou mais de 1 minuto? Às vezes demora um pouco até funcionar.",
+        "conditions": [
+            "If less than 1 minute has passed since payment, wait for machine to activate",
+            "If more than 1 minute has passed since payment, check machine status"
+        ],
+        "apiActions": [
+            "Digipay API: Verify machine status",
+            "Digipay API: Credit machine time if necessary"
+        ]
+    },
+    {
+        "question": "A máquina de lavar deu um erro",
+        "answer": "Pode descrever o que vê no visor da máquina de lavar? Normalmente quando existe um erro aparece a letra A e o número do erro. Por exemplo A2.",
+        "conditions": [],
+        "apiActions": [
+            "Interpret error code from description"
+        ]
+    },
+    {
+        "question": "Terminou de lavar e a porta nao abre",
+        "answer": "Se a lavagem terminou agora mesmo, pode ser que necessite de mais um minuto até poder abrir a porta. Se já passou o tempo suficiente, prima o botão 'Open' até ouvir o sinal sonoro de abertura, às vezes poderá demorar cerca de 25 segundos.",
+        "conditions": ["If washing cycle has recently finished"],
+        "apiActions": [
+            "Visense API: Reboot machine if necessary"
+        ]
+    },
+    {
+        "question": "Está a mostrar o erro A02",
+        "answer": "Erro A02 indica que a porta da máquina de lavar esteja mal fechada. Pode abrir por favor e fechar de novo?",
+        "conditions": ["If the problem persists, it's a damage"],
+        "apiActions": [
+            "Guide customer to retry closing the door",
+            "Flag for maintenance if issue persists"
+        ]
+    },
+    {
+        "question": "Quero abrir a porta da máquina de secar",
+        "answer": "Pode abrir a máquina de secar puxando a porta. As máquinas de secar estão sempre aberta. Para continuar a secagem basta fechar e porta e primir o botão 'Start'.",
+        "conditions": [],
+        "apiActions": []
+    }
+]

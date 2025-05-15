@@ -32,16 +32,66 @@ def vector_search(collection, user_query, k=5, num_candidates=150):
     print(f"Retrieved {len(docs)} documents")
     return docs
 
+def load_instructions():
+    """Load custom instructions from file."""
+    try:
+        with open("chatbot_instructions.txt", "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        print("Warning: Instructions file not found. Using default instructions.")
+        return (
+            "You are a helpful customer service chatbot named Assistente PagaLava. "
+            "Only answer questions related to laundry services."
+        )
+
 def create_prompt(documents, user_query):
+    """Create a prompt with instructions and context."""
+    instructions = load_instructions()
     context = "\n\n".join([doc.get("body", "") for doc in documents])
+    
     prompt = (
-        "Answer the question based only on the following context. "
-        "If the context is empty, say I DON'T KNOW\n\n"
+        f"{instructions}\n\n"
+        f"Answer the question based only on the following context.\n"
+        f"If the context doesn't contain relevant information, respond in Portuguese: "
+        f"\"Não tenho essa informação específica, mas posso ajudar com outras perguntas sobre os serviços da PagaLava.\"\n\n"
         f"Context:\n{context}\n\nQuestion: {user_query}"
     )
     return prompt
 
+def is_on_topic(query):
+    """Basic check to determine if query is on-topic for a laundromat chatbot."""
+    laundry_keywords = [
+        # English keywords
+        "laundry", "wash", "dry", "clean", "detergent", "stain", "fold", 
+        "machine", "dryer", "service", "hours", "price", "cost",
+        "location", "pagalava", "payment", "clothes", "fabric", "lavanderia",
+        
+        # Portuguese keywords from FAQ
+        "lavagem", "secagem", "demora", "tempo", "detergente", "amaciador", 
+        "roupa", "máquina", "erro", "porta", "abertos", "horas", "espuma", 
+        "ecológicos", "pagamento", "cartão", "engomadoria", "recolha", 
+        "entrega", "ciclos", "vincos", "esqueci", "câmaras", "linha vermelha",
+        "tira-nódoas", "higienizante", "loja", "rua", "brasil", "vasconcelos"
+    ]
+    
+    query_lower = query.lower()
+    
+    # Simple keyword matching - can be enhanced with more sophisticated methods
+    for keyword in laundry_keywords:
+        if keyword in query_lower:
+            return True
+    
+    # If no keywords match, we'll still let it through to the RAG system
+    # which will use the instruction file to guide its response
+    return True
+
 def generate_answer(collection, user_query, serverless_url):
+    """Generate answer with topic filtering."""
+    # Quick check if the query is on-topic
+    if not is_on_topic(user_query):
+        print("Off-topic query detected, but will let instructions guide the model")
+    
+    # Continue with regular processing
     docs = vector_search(collection, user_query)
     prompt = create_prompt(docs, user_query)
     messages = [{"role": "user", "content": prompt}]
@@ -88,17 +138,18 @@ def main():
 
     # Interactive mode if no question is provided
     if not args.question:
-        print("RAG Query Interactive Mode (type 'exit' to quit)")
+        print("Assistente PagaLava - Laundry Service Bot (type 'exit' to quit)")
+        print("Ask questions about laundry services, hours, pricing, etc.")
         while True:
-            question = input("\nEnter your question: ")
+            question = input("\nComo posso ajudar com suas necessidades de lavanderia? ")
             if question.lower() == "exit":
                 break
-            print("\nAnswer:")
+            print("\nAssistente PagaLava:")
             answer = generate_answer(collection, question, serverless_url)
             print(answer)
     else:
         # One-off query mode
-        print("\nAnswer:")
+        print("\nAssistente PagaLava:")
         answer = generate_answer(collection, args.question, serverless_url)
         print(answer)
 
