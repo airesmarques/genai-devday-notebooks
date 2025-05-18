@@ -83,6 +83,42 @@ def create_prompt(documents, user_query):
     return prompt
 
 def is_on_topic(query):
+    """Check if the query is on-topic for the laundromat domain."""
+    laundry_keywords = [
+        "lavanderia", "lavandaria", "máquina", "maquina", "lavar", "secar", "secadora", 
+        "lavadora", "detergente", "pagamento", "cartão", "cartao", "cesto", "moedas", 
+        "roupa", "roupas", "porta", "machine", "valor", "preço", "preco", "tempo", "pagalava"
+    ]
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in laundry_keywords)
+
+def is_technical_issue(query):
+    """Check if query is about a technical issue that may require intervention."""
+    issue_keywords = [
+        "não funciona", "nao funciona", "erro", "error", "problema", "avariada", 
+        "não liga", "nao liga", "bloqueada", "travada", "stuck", "porta não abre",
+        "porta nao abre", "não abre", "nao abre", "a02", "a03", "código", "codigo",
+        "não começa", "nao comeca", "parou", "não aceita", "nao aceita"
+    ]
+    query_lower = query.lower()
+    return any(keyword in query_lower for keyword in issue_keywords)
+
+def has_required_info(query, session_memory=None):
+    """Check if we have necessary information to take action."""
+    # Extract information from query
+    laundry_id, machine_number = extract_machine_info(query)
+    
+    # If session memory exists, use it to supplement missing info
+    if not laundry_id and session_memory and session_memory.get("laundry_id"):
+        laundry_id = session_memory.get("laundry_id")
+    
+    if not machine_number and session_memory and session_memory.get("machine_number"):
+        machine_number = session_memory.get("machine_number")
+    
+    # Return a tuple of (has_all_info, laundry_id, machine_number)
+    return (bool(laundry_id and machine_number), laundry_id, machine_number)
+
+def is_on_topic(query):
     """Basic check to determine if query is on-topic for a laundromat chatbot."""
     laundry_keywords = [
         # English keywords
@@ -165,79 +201,116 @@ def is_door_issue(query):
     query_lower = query.lower()
     return any(keyword in query_lower for keyword in door_keywords)
 
+def should_reboot(history, user_query):
+    """
+    Determine if the user has previously reported a door issue and now confirms reboot.
+    Returns (should_reboot: bool, laundry_id, machine_number)
+    """
+    confirm_keywords = ["sim", "yes", "confirmo", "reiniciar", "reboot", "reset", "ok"]
+    # Check if user_query is a confirmation
+    if any(word in user_query.lower() for word in confirm_keywords):
+        # Look for the most recent door issue in the history
+        for msg in reversed(history):
+            if msg["role"] == "user" and is_door_issue(msg["content"]):
+                laundry_id, machine_number = extract_machine_info(msg["content"])
+                if machine_number:
+                    return True, laundry_id, machine_number
+    return False, None, None
+
+def store_session_memory(collection, session_id, laundry_id=None, machine_number=None, error_code=None):
+    """Store or update session memory with important info."""
+    update = {
+        "session_id": session_id,
+        "laundry_id": laundry_id,
+        "machine_number": machine_number,
+        "error_code": error_code,
+        "updated_at": datetime.now()
+    }
+    # Only update fields that are not None
+    update = {k: v for k, v in update.items() if v is not None or k in ["session_id", "updated_at"]}
+    collection.update_one(
+        {"session_id": session_id},
+        {"$set": update},
+        upsert=True
+    )
+
+def retrieve_session_memory(collection, session_id):
+    """Retrieve session memory for a session."""
+    doc = collection.find_one({"session_id": session_id})
+    if doc:
+        return {
+            "laundry_id": doc.get("laundry_id"),
+            "machine_number": doc.get("machine_number"),
+            "error_code": doc.get("error_code")
+        }
+    return {}
+
 # Modify generate_answer to handle machine actions
 def generate_answer(db, collection, user_query, openai_api_key, session_id="default", model="gpt-4o"):
     """Generate answer with conversation memory and API actions."""
-    # Make sure we have a history collection
     history_collection = db["chat_history"]
-    
-    # Create index on session_id if it doesn't exist
+    session_mem_collection = db["session_memory"]
+
     if "session_id" not in history_collection.index_information():
         history_collection.create_index("session_id")
-    
-    # Check for action opportunities
-    perform_action = False
-    action_response = None
-    
-    # Check if this is a door issue and potentially needs machine reboot
+    if "session_id" not in session_mem_collection.index_information():
+        session_mem_collection.create_index("session_id")
+
+    message_history = retrieve_session_history(history_collection, session_id)
+    session_memory = retrieve_session_memory(session_mem_collection, session_id)
+
+    # Check if this is a door issue
     if is_door_issue(user_query):
         laundry_id, machine_number = extract_machine_info(user_query)
-        
+        store_session_memory(session_mem_collection, session_id, laundry_id=laundry_id, machine_number=machine_number)
         if machine_number:
-            # We have a door issue and a machine number - ask if user wants to reboot
-            message_history = retrieve_session_history(history_collection, session_id)
-            
-            # Check if we already suggested rebooting in this conversation
-            reboot_suggested = any("reiniciar" in msg.get("content", "").lower() or 
-                                 "reboot" in msg.get("content", "").lower() 
-                                 for msg in message_history if msg.get("role") == "assistant")
-            
-            if reboot_suggested:
-                # Check if user confirmed wanting to reboot
-                confirm_keywords = ["sim", "yes", "confirmo", "reiniciar", "reboot", "reset", "ok"]
-                if any(keyword in user_query.lower() for keyword in confirm_keywords):
-                    # User confirmed - execute reboot
-                    try:
-                        api = ViSenseAPI()
-                        result = api.reboot_machine(laundry_id, machine_number)
-                        
-                        if result.get("status") == "success":
-                            action_response = f"✅ Máquina {machine_number} da lavandaria {laundry_id} reiniciada com sucesso! Por favor, tente abrir a porta novamente. Caso não consiga, aguarde 1 minuto e tente novamente."
-                        else:
-                            action_response = f"❌ Não foi possível reiniciar a máquina {machine_number}. Erro: {result.get('message', 'desconhecido')}. Por favor, tente seguir as instruções manuais ou contacte-nos."
-                        
-                        perform_action = True
-                    except Exception as e:
-                        action_response = f"❌ Ocorreu um erro ao tentar reiniciar a máquina: {str(e)}. Por favor, tente seguir as instruções manuais ou contacte-nos."
-                        perform_action = True
-    
-    # Initialize OpenAI client
-    client = openai.OpenAI(api_key=openai_api_key)
-    
-    # If we performed an action, use that as the answer
-    if perform_action and action_response:
-        # Store the conversation
+            # Ask for confirmation to reboot
+            answer = (
+                f"Detectei que a porta da máquina {machine_number} ({laundry_id}) está com problema. "
+                "Deseja que eu tente reiniciar a máquina remotamente? Responda 'sim' para confirmar."
+            )
+            store_chat_message(history_collection, session_id, "user", user_query)
+            store_chat_message(history_collection, session_id, "assistant", answer)
+            return answer
+
+    # Check if user is confirming reboot after a door issue
+    reboot, laundry_id, machine_number = should_reboot(message_history, user_query)
+    if reboot:
+        # Use session memory if missing info
+        if not laundry_id or not machine_number:
+            mem = retrieve_session_memory(session_mem_collection, session_id)
+            laundry_id = laundry_id or mem.get("laundry_id")
+            machine_number = machine_number or mem.get("machine_number")
+        try:
+            api = ViSenseAPI()
+            result = api.reboot_machine(laundry_id, machine_number)
+            if result.get("status") == "success":
+                action_response = (
+                    f"✅ Máquina {machine_number} da lavandaria {laundry_id} reiniciada com sucesso! "
+                    "Por favor, tente abrir a porta novamente. Caso não consiga, aguarde 1 minuto e tente novamente."
+                )
+            else:
+                action_response = (
+                    f"❌ Não foi possível reiniciar a máquina {machine_number}. "
+                    f"Erro: {result.get('message', 'desconhecido')}. Por favor, tente seguir as instruções manuais ou contacte-nos."
+                )
+        except Exception as e:
+            action_response = (
+                f"❌ Ocorreu um erro ao tentar reiniciar a máquina: {str(e)}. "
+                "Por favor, tente seguir as instruções manuais ou contacte-nos."
+            )
         store_chat_message(history_collection, session_id, "user", user_query)
         store_chat_message(history_collection, session_id, "assistant", action_response)
         return action_response
-    
-    # Otherwise, continue with regular RAG flow
+
+    # ...existing RAG flow...
     docs = vector_search(collection, user_query)
     context_prompt = create_prompt(docs, user_query)
-    message_history = retrieve_session_history(history_collection, session_id)
-    
-    # Format messages for OpenAI
-    messages = [
-        {"role": "system", "content": context_prompt}
-    ]
-    
-    # Add conversation history
+    messages = [{"role": "system", "content": context_prompt}]
     messages.extend(message_history)
-    
-    # Add current user question
     messages.append({"role": "user", "content": user_query})
-    
-    # Get response from OpenAI
+
+    client = openai.OpenAI(api_key=openai_api_key)
     print("Requesting answer from GPT-4...")
     response = client.chat.completions.create(
         model=model,
@@ -245,19 +318,10 @@ def generate_answer(db, collection, user_query, openai_api_key, session_id="defa
         temperature=0.7,
         max_tokens=1000
     )
-    
-    # Extract answer
     answer = response.choices[0].message.content
-    
-    # If this is a door issue but we don't have machine number, suggest getting it
-    if is_door_issue(user_query) and not perform_action:
-        if not machine_number:
-            answer += "\n\nPara que eu possa ajudar a reiniciar a máquina, preciso saber o número da máquina. Pode me dizer qual é o número da máquina?"
-    
-    # Store the conversation
+
     store_chat_message(history_collection, session_id, "user", user_query)
     store_chat_message(history_collection, session_id, "assistant", answer)
-    
     return answer
 
 def main():
